@@ -66,6 +66,8 @@ pub struct RenderArgs {
 }
 
 pub fn run(args: RenderArgs) -> Result<()> {
+    #[cfg(feature = "perfil")]
+    on_viz::perfil::marca("inicio");
     let settings = args.scene.settings(&args.model)?;
     let performance = scene::build(&args.input, &settings)?;
     on_viz::export(

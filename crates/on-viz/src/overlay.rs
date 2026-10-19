@@ -178,6 +178,7 @@ fn show_overlay_text(
     data: Res<OverlayData>,
     texts: Query<(&mut OverlayText, &mut Text, &mut TextColor)>,
 ) {
+    medir!("show_overlay_text");
     let now = clock.0;
     for (mut state, mut text, mut colour) in texts {
         let line = &data.spec.lines[state.line];

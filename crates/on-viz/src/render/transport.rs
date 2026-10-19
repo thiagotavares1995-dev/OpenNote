@@ -82,6 +82,7 @@ pub(crate) fn advance_transport(
     performance: Res<Performance>,
     audio: Res<Audio>,
 ) {
+    medir!("advance_transport");
     match audio.player() {
         Some(player) => {
             let heard = player.position();
@@ -133,6 +134,7 @@ pub(crate) fn handle_input(
     performance: Res<Performance>,
     menus: Option<Res<bevy_egui::input::EguiWantsInput>>,
 ) {
+    medir!("handle_input");
     if menus.is_some_and(|menus| menus.wants_any_keyboard_input()) {
         return;
     }
@@ -303,11 +305,13 @@ pub(crate) fn settle_keys(
     playing: Res<Playing>,
     mut keys: ResMut<Keys>,
 ) {
+    medir!("settle_keys");
     keys.0 = performance.timeline.key_depression_for(transport.position, playing.0);
 }
 
 /// Hears only the hands that are playing, again whenever that changes.
 pub(crate) fn mute_hands(playing: Res<Playing>, performance: Res<Performance>, audio: Res<Audio>) {
+    medir!("mute_hands");
     if playing.is_changed() && !playing.is_added() {
         audio.load(performance.timeline.audio_notes_for(playing.0));
     }

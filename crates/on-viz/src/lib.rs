@@ -2,6 +2,18 @@
 //! exported as a video. The timeline and hand motion work without the `render` feature;
 //! the Bevy app needs it.
 
+/// Times the rest of the enclosing block under a name, in a `perfil` build; nothing otherwise.
+#[cfg(feature = "perfil")]
+macro_rules! medir {
+    ($nome:expr) => {
+        let _medida = crate::perfil::medir($nome);
+    };
+}
+#[cfg(not(feature = "perfil"))]
+macro_rules! medir {
+    ($nome:expr) => {};
+}
+
 #[cfg(feature = "render")]
 pub mod export;
 #[cfg(feature = "render")]
@@ -12,6 +24,8 @@ pub mod layout;
 pub mod motion;
 #[cfg(feature = "render")]
 pub mod overlay;
+#[cfg(feature = "perfil")]
+pub mod perfil;
 #[cfg(feature = "render")]
 pub mod render;
 pub mod rig;

@@ -25,6 +25,8 @@ rfd = { version = "0.17", optional = true }
 [features]
 default = ["render"]
 render = ["dep:bevy", "dep:bevy_egui", "dep:rfd", "dep:image", "dep:serde", "dep:serde_json", "on-audio/playback"]
+# Timings, frame hashes and checks for measuring the export (see src/perfil.rs).
+perfil = ["render"]
 
 [lints]
 workspace = true

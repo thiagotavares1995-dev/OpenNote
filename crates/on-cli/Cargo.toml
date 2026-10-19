@@ -26,5 +26,8 @@ clap_complete = "4"
 clap_mangen = "0.2"
 tracing-subscriber.workspace = true
 
+[features]
+perfil = ["on-viz/perfil"]
+
 [lints]
 workspace = true

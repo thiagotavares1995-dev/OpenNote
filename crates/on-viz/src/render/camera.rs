@@ -96,6 +96,7 @@ pub(crate) fn fit_camera_viewport(
     windows: Query<&Window>,
     cameras: Query<&mut Camera, With<Camera3d>>,
 ) {
+    medir!("fit_camera_viewport");
     if inset.top <= 0.5 && inset.bottom <= 0.5 {
         for mut camera in cameras {
             if camera.viewport.is_some() {
@@ -156,6 +157,7 @@ pub(crate) fn apply_visuals(
     cameras: Query<(Entity, &mut bevy::post_process::bloom::Bloom), With<Camera3d>>,
     mut lights: Query<&mut DirectionalLight, With<KeyLight>>,
 ) {
+    medir!("apply_visuals");
     if !visuals.is_changed() {
         return;
     }

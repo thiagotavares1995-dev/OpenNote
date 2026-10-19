@@ -648,6 +648,7 @@ pub fn pose_hands(
     mut transforms: Query<&mut Transform>,
     mut visibility: Query<&mut Visibility>,
 ) {
+    medir!("pose_hands");
     let offset = Vec3::Y * KEYBOARD_Y_MM;
     let poses = crate::timeline::pose_both_decided(
         &performance.animators,

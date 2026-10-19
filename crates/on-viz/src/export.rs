@@ -79,6 +79,11 @@ impl Export {
 }
 
 pub fn export(performance: Performance, options: VideoOptions) -> Result<()> {
+    #[cfg(feature = "perfil")]
+    {
+        crate::perfil::marca("cena_pronta");
+        crate::perfil::contar("notas", performance.timeline.notes.len() as u64);
+    }
     let ffmpeg = check_ffmpeg(&options.ffmpeg)?;
 
     let audio_path = options.path.with_extension("opennote.wav");
@@ -95,9 +100,13 @@ pub fn export(performance: Performance, options: VideoOptions) -> Result<()> {
     )
     .context("rendering the soundtrack")?;
     let _soundtrack = Scratch(audio_path.clone());
+    #[cfg(feature = "perfil")]
+    crate::perfil::marca("wav_pronto");
 
     let seconds = (last - LEAD_IN + TAIL_SECONDS) / options.speed.max(1e-6);
     let total = (seconds * f64::from(options.fps)).ceil() as u32;
+    #[cfg(feature = "perfil")]
+    let total = crate::perfil::parar_em().map_or(total, |limite| total.min(limite));
 
     let mut encoder = start_ffmpeg(&ffmpeg, &options, &audio_path, total)?;
     let stdin = encoder.stdin.take().context("ffmpeg did not give us anywhere to write frames")?;
@@ -111,7 +120,14 @@ pub fn export(performance: Performance, options: VideoOptions) -> Result<()> {
         .name("opennote-encode".into())
         .spawn(move || {
             let mut stdin = std::io::BufWriter::with_capacity(1 << 20, stdin);
+            #[cfg(feature = "perfil")]
+            let mut hashes = crate::perfil::arquivo_hashes().map(|caminho| (caminho, String::new()));
             for frame in incoming {
+                #[cfg(feature = "perfil")]
+                if let Some((_, texto)) = hashes.as_mut() {
+                    texto.push_str(&format!("{:016x}
+", crate::perfil::hash_quadro(&frame)));
+                }
                 if let Err(error) = stdin.write_all(&frame) {
                     tracing::error!("ffmpeg stopped taking frames: {error}");
                     report.store(true, Ordering::Relaxed);
@@ -121,6 +137,10 @@ pub fn export(performance: Performance, options: VideoOptions) -> Result<()> {
             if let Err(error) = stdin.flush() {
                 tracing::error!("could not finish writing to ffmpeg: {error}");
                 report.store(true, Ordering::Relaxed);
+            }
+            #[cfg(feature = "perfil")]
+            if let Some((caminho, texto)) = hashes {
+                let _ = std::fs::write(caminho, texto);
             }
         })
         .context("starting the encoder thread")?;
@@ -161,11 +181,23 @@ pub fn export(performance: Performance, options: VideoOptions) -> Result<()> {
     if let Some(overlay) = overlay {
         overlay.install(&mut app);
     }
+    #[cfg(feature = "perfil")]
+    {
+        crate::perfil::agenda::instalar(&mut app);
+        crate::perfil::marca("app_inicio");
+    }
     app.run();
 
+    #[cfg(feature = "perfil")]
+    crate::perfil::marca("app_fim");
     drop(app);
     let _ = writer.join();
     let status = encoder.wait().context("waiting for ffmpeg")?;
+    #[cfg(feature = "perfil")]
+    {
+        crate::perfil::marca("encoder_fim");
+        crate::perfil::gravar();
+    }
     if !status.success() {
         bail!("ffmpeg failed: {status}");
     }
@@ -278,12 +310,18 @@ fn drive_export(
     clock: Option<ResMut<crate::overlay::OverlayClock>>,
     mut exit: MessageWriter<AppExit>,
 ) {
+    medir!("drive_export");
     let Some(mut export) = export else {
         return;
     };
     if export.trouble.load(Ordering::Relaxed) {
         exit.write(AppExit::error());
         return;
+    }
+    #[cfg(feature = "perfil")]
+    {
+        crate::perfil::marca("aquecimento_inicio");
+        crate::perfil::contar("updates", 1);
     }
     if export.warmup > 0 {
         export.warmup -= 1;
@@ -292,13 +330,26 @@ fn drive_export(
         return;
     }
     if export.sent >= export.total {
+        #[cfg(feature = "perfil")]
+        crate::perfil::marca("quadros_fim");
         exit.write(AppExit::Success);
         return;
     }
     // Several frames are rendered and read back at once; each screenshot keeps its own index
     // and the encoder still receives them in order.
     if export.in_flight >= SCREENSHOTS_IN_FLIGHT || export.frame >= export.total {
+        #[cfg(feature = "perfil")]
+        crate::perfil::contar(
+            if export.frame >= export.total { "updates_esperando_fim" } else { "updates_capturas_cheias" },
+            1,
+        );
         return;
+    }
+    #[cfg(feature = "perfil")]
+    {
+        crate::perfil::marca("quadros_inicio");
+        crate::perfil::contar("quadros_pedidos", 1);
+        crate::perfil::pico("capturas_em_voo", u64::from(export.in_flight + 1));
     }
 
     transport.position = export.moment(export.frame);

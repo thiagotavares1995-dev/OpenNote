@@ -273,8 +273,11 @@ pub(crate) fn move_notes(
     performance: Res<Performance>,
     bars: Query<(&NoteBar, &mut Transform, &mut Visibility)>,
 ) {
+    medir!("move_notes");
     let layout = &performance.layout;
     let now = transport.position;
+    #[cfg(feature = "perfil")]
+    let mut visiveis = 0u64;
     for (bar, mut transform, mut visibility) in bars {
         let (bottom, height) = bar_extent(layout, bar, now);
         let top = bottom + height;
@@ -284,7 +287,13 @@ pub(crate) fn move_notes(
 
         *visibility =
             if top > 0.0 && bottom < layout.lane_height { Visibility::Visible } else { Visibility::Hidden };
+        #[cfg(feature = "perfil")]
+        if *visibility == Visibility::Visible {
+            visiveis += 1;
+        }
     }
+    #[cfg(feature = "perfil")]
+    crate::perfil::pico("barras_visiveis", visiveis);
 }
 
 pub(crate) fn press_keys(
@@ -293,6 +302,7 @@ pub(crate) fn press_keys(
     mut materials: ResMut<Assets<Lacquered>>,
     keys: Query<(&KeyTop, &mut Transform, &MeshMaterial3d<Lacquered>)>,
 ) {
+    medir!("press_keys");
     let states = &down.0;
     for (key, mut transform, material) in keys {
         let depth = states.depth_of(key.midi);
@@ -333,6 +343,7 @@ pub(crate) fn update_labels(
     bars: Query<(&NoteBar, &Transform)>,
     labels: Query<(&mut Node, &mut Text, &mut TextColor), With<FingerLabel>>,
 ) {
+    medir!("update_labels");
     let Ok((camera, camera_transform)) = camera.single() else {
         return;
     };

@@ -49,6 +49,7 @@ pub(crate) fn recolour_sparks(
     mut sparks: ResMut<SparkColours>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
+    medir!("recolour_sparks");
     if note_colours.is_changed() && !note_colours.is_added() {
         *sparks = SparkColours::new(&mut materials, sparks.texture.clone(), note_colours.0);
     }
@@ -136,6 +137,7 @@ pub(crate) fn raise_flashes(
     keys: Res<Keys>,
     flashes: Query<(&Flash, &mut Transform, &mut Visibility, &mut MeshMaterial3d<StandardMaterial>)>,
 ) {
+    medir!("raise_flashes");
     if !visuals.effects {
         if visuals.is_changed() {
             for (_, _, mut visibility, _) in flashes {
@@ -190,6 +192,7 @@ pub(crate) fn light_struck_keys(
     keys: Res<Keys>,
     lights: Query<(&mut PointLight, &mut Transform, &mut Visibility), With<NoteLight>>,
 ) {
+    medir!("light_struck_keys");
     let layout = &performance.layout;
     let states = &keys.0;
     let offset = Vec3::Y * KEYBOARD_Y_MM;
@@ -232,6 +235,7 @@ pub(crate) fn update_sparks(
     playing: Res<Playing>,
     sparks: Query<(&mut Transform, &mut Visibility, &mut MeshMaterial3d<StandardMaterial>), With<Spark>>,
 ) {
+    medir!("update_sparks");
     if !visuals.effects {
         if visuals.is_changed() {
             for (_, mut visibility, _) in sparks {
