@@ -148,7 +148,58 @@ pub(crate) mod agenda {
         depois_post: Option<Instant>,
     }
 
+    /// Time spent by the render thread in each stretch of its schedule, between the render sets.
+    #[derive(Resource, Default)]
+    struct RelogioRender {
+        inicio: Option<Instant>,
+        ultimo: Option<Instant>,
+    }
+
+    fn instalar_render(app: &mut App) {
+        use bevy::render::{Render, RenderApp, RenderSystems as S};
+        let Some(render) = app.get_sub_app_mut(RenderApp) else { return };
+        render.init_resource::<RelogioRender>();
+        render.add_systems(
+            Render,
+            (|mut r: ResMut<RelogioRender>| {
+                let agora = Instant::now();
+                if let Some(antes) = r.inicio {
+                    super::somar("render:periodo", agora.duration_since(antes).as_nanos());
+                }
+                r.inicio = Some(agora);
+                r.ultimo = Some(agora);
+            })
+            .before(S::ExtractCommands),
+        );
+        let fases: [(&'static str, S, Option<S>); 10] = [
+            ("render:ExtractCommands", S::ExtractCommands, Some(S::PrepareMeshes)),
+            ("render:PrepareAssets+Meshes", S::PrepareMeshes, Some(S::CreateViews)),
+            ("render:CreateViews", S::CreateViews, Some(S::Specialize)),
+            ("render:Specialize", S::Specialize, Some(S::PrepareViews)),
+            ("render:PrepareViews", S::PrepareViews, Some(S::Queue)),
+            ("render:Queue", S::Queue, Some(S::PhaseSort)),
+            ("render:PhaseSort", S::PhaseSort, Some(S::Prepare)),
+            ("render:Prepare", S::Prepare, Some(S::Render)),
+            ("render:Render(grafo)", S::Render, Some(S::Cleanup)),
+            ("render:Cleanup", S::PostCleanup, None),
+        ];
+        for (nome, depois, antes) in fases {
+            let marca = move |mut r: ResMut<RelogioRender>| {
+                let agora = Instant::now();
+                if let Some(u) = r.ultimo {
+                    super::somar(nome, agora.duration_since(u).as_nanos());
+                }
+                r.ultimo = Some(agora);
+            };
+            match antes {
+                Some(antes) => render.add_systems(Render, marca.after(depois).before(antes)),
+                None => render.add_systems(Render, marca.after(depois)),
+            };
+        }
+    }
+
     pub(crate) fn instalar(app: &mut App) {
+        instalar_render(app);
         app.init_resource::<Relogio>();
         for rotulo in [AntesUpdate.intern(), DepoisUpdate.intern(), DepoisPostUpdate.intern()] {
             app.init_schedule(rotulo);
