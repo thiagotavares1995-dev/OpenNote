@@ -4794,6 +4794,8 @@ dependencies = [
  "on-hand",
  "on-score",
  "rfd",
+ "serde",
+ "serde_json",
  "tracing",
 ]
 

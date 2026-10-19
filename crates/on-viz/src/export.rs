@@ -1,6 +1,7 @@
 //! Renders the performance offscreen, frame by frame, and pipes it to ffmpeg with the
 //! soundtrack.
 
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -12,7 +13,7 @@ use anyhow::{bail, Context, Result};
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{Screenshot, ScreenshotCaptured};
 
-use crate::render::{default_plugins, Audio, Performance, Transport, VisualizerPlugin, LEAD_IN};
+use crate::render::{Audio, Performance, Transport, VisualizerPlugin, LEAD_IN};
 
 const TAIL_SECONDS: f64 = 2.0;
 
@@ -27,6 +28,12 @@ pub struct VideoOptions {
     pub speed: f64,
     pub ffmpeg: PathBuf,
     pub crf: u8,
+    /// The ffmpeg video encoder: libx264 (CPU), or h264_nvenc/hevc_nvenc (NVIDIA GPU).
+    pub codec: String,
+    /// An optional ffmpeg -vf filter applied while encoding (e.g. burnt-in subtitles).
+    pub video_filter: Option<String>,
+    /// An information overlay (fixed image and timed text) drawn by the GPU; see `overlay`.
+    pub overlay: Option<PathBuf>,
     pub note_colours: [bevy::color::Color; 2],
 }
 
@@ -40,6 +47,9 @@ impl Default for VideoOptions {
             speed: 1.0,
             ffmpeg: PathBuf::from("ffmpeg"),
             crf: 18,
+            codec: "libx264".into(),
+            video_filter: None,
+            overlay: None,
             note_colours: crate::render::NoteColours::default().0,
         }
     }
@@ -49,10 +59,14 @@ impl Default for VideoOptions {
 struct Export {
     options: VideoOptions,
     target: Handle<Image>,
+    /// The next frame to ask for.
     frame: u32,
+    /// The next frame to hand to the encoder; frames captured early wait in `ready`.
+    sent: u32,
     total: u32,
     warmup: u32,
-    in_flight: bool,
+    in_flight: u32,
+    ready: BTreeMap<u32, Vec<u8>>,
     frames: SyncSender<Vec<u8>>,
     trouble: Arc<AtomicBool>,
     start: f64,
@@ -85,7 +99,7 @@ pub fn export(performance: Performance, options: VideoOptions) -> Result<()> {
     let seconds = (last - LEAD_IN + TAIL_SECONDS) / options.speed.max(1e-6);
     let total = (seconds * f64::from(options.fps)).ceil() as u32;
 
-    let mut encoder = start_ffmpeg(&ffmpeg, &options, &audio_path)?;
+    let mut encoder = start_ffmpeg(&ffmpeg, &options, &audio_path, total)?;
     let stdin = encoder.stdin.take().context("ffmpeg did not give us anywhere to write frames")?;
 
     // Bounded, so that rendering waits for the encoder rather than holding every frame
@@ -113,11 +127,12 @@ pub fn export(performance: Performance, options: VideoOptions) -> Result<()> {
 
     println!("Rendering {} frames at {}x{}, {} fps.", total, options.width, options.height, options.fps);
 
+    let overlay = options.overlay.as_deref().map(crate::overlay::Overlay::load).transpose()?;
     let assets = performance.assets_root.clone();
     let width = options.width;
     let height = options.height;
     let mut app = App::new();
-    app.add_plugins(default_plugins("OpenNote — exporting", &assets))
+    app.add_plugins(headless_plugins(&assets))
         .insert_resource(crate::render::NoteColours(options.note_colours))
         .insert_resource(performance)
         .init_resource::<Audio>()
@@ -143,6 +158,9 @@ pub fn export(performance: Performance, options: VideoOptions) -> Result<()> {
         start: LEAD_IN,
     });
     app.add_systems(First, drive_export);
+    if let Some(overlay) = overlay {
+        overlay.install(&mut app);
+    }
     app.run();
 
     drop(app);
@@ -155,10 +173,32 @@ pub fn export(performance: Performance, options: VideoOptions) -> Result<()> {
     Ok(())
 }
 
+/// The export draws only into an offscreen image, so it runs without a window: a window that
+/// never has focus is held to 60 updates a second, and its present pacing would cap the
+/// export at one frame per update tick.
+fn headless_plugins(assets: &Path) -> impl PluginGroup {
+    let mut plugins = DefaultPlugins
+        .build()
+        .disable::<bevy::log::LogPlugin>()
+        .disable::<bevy::winit::WinitPlugin>()
+        .set(WindowPlugin {
+            primary_window: None,
+            exit_condition: bevy::window::ExitCondition::DontExit,
+            ..default()
+        })
+        .add(bevy::app::ScheduleRunnerPlugin::run_loop(std::time::Duration::ZERO));
+    if let Some(path) = assets.to_str() {
+        plugins = plugins.set(AssetPlugin { file_path: path.to_string(), ..default() });
+    }
+    plugins
+}
+
 #[derive(Resource, Deref)]
 struct ExportTarget(Handle<Image>);
 
 const FRAMES_IN_FLIGHT: usize = 8;
+
+const SCREENSHOTS_IN_FLIGHT: u32 = 8;
 
 /// A temporary file, removed however the export ends.
 struct Scratch(std::path::PathBuf);
@@ -190,9 +230,11 @@ fn build_export_resource(mut commands: Commands) {
             options: pending.options,
             target: target.0,
             frame: 0,
+            sent: 0,
             total: pending.total,
             warmup: WARMUP_FRAMES,
-            in_flight: false,
+            in_flight: 0,
+            ready: BTreeMap::new(),
             frames: pending.frames,
             trouble: pending.trouble,
             start: pending.start,
@@ -233,6 +275,7 @@ fn drive_export(
     mut commands: Commands,
     export: Option<ResMut<Export>>,
     mut transport: ResMut<Transport>,
+    clock: Option<ResMut<crate::overlay::OverlayClock>>,
     mut exit: MessageWriter<AppExit>,
 ) {
     let Some(mut export) = export else {
@@ -248,36 +291,53 @@ fn drive_export(
         transport.playing = false;
         return;
     }
-    if export.in_flight {
+    if export.sent >= export.total {
+        exit.write(AppExit::Success);
         return;
     }
-    if export.frame >= export.total {
-        exit.write(AppExit::Success);
+    // Several frames are rendered and read back at once; each screenshot keeps its own index
+    // and the encoder still receives them in order.
+    if export.in_flight >= SCREENSHOTS_IN_FLIGHT || export.frame >= export.total {
         return;
     }
 
     transport.position = export.moment(export.frame);
+    if let Some(mut clock) = clock {
+        clock.0 = f64::from(export.frame) / f64::from(export.options.fps);
+    }
     transport.playing = false;
-    export.in_flight = true;
+    export.in_flight += 1;
 
-    let frames = export.frames.clone();
     let index = export.frame;
+    export.frame += 1;
     let total = export.total;
     let handle = export.target.clone();
     commands.spawn(Screenshot::image(handle)).observe(
         move |captured: On<ScreenshotCaptured>, mut export: ResMut<Export>| {
-            match captured.image.clone().try_into_dynamic() {
-                Ok(image) => {
-                    if frames.send(image.to_rgb8().into_raw()).is_err() {
-                        error!("the encoder went away partway through the export");
-                    }
+            // The target is 8-bit sRGB RGBA with no row padding, which ffmpeg reads as `rgba`;
+            // handing the bytes over as they are keeps per-pixel work off the main thread.
+            let expected = (export.options.width * export.options.height * 4) as usize;
+            let pixels = match captured.image.data.as_ref() {
+                Some(data) if data.len() == expected => data.clone(),
+                _ => {
+                    error!("could not read frame {index} back: unexpected image size");
+                    export.trouble.store(true, Ordering::Relaxed);
+                    Vec::new()
                 }
-                Err(error) => error!("could not read frame {index} back: {error}"),
-            }
-            export.frame += 1;
-            export.in_flight = false;
-            if index % 60 == 0 {
-                println!("  frame {index} of {total}");
+            };
+            export.in_flight -= 1;
+            export.ready.insert(index, pixels);
+            loop {
+                let next = export.sent;
+                let Some(frame) = export.ready.remove(&next) else { break };
+                if export.frames.send(frame).is_err() {
+                    error!("the encoder went away partway through the export");
+                    export.trouble.store(true, Ordering::Relaxed);
+                }
+                export.sent += 1;
+                if next % 60 == 0 {
+                    println!("  frame {next} of {total}");
+                }
             }
         },
     );
@@ -299,21 +359,36 @@ fn check_ffmpeg(path: &Path) -> Result<PathBuf> {
     }
 }
 
-fn start_ffmpeg(ffmpeg: &Path, options: &VideoOptions, audio: &Path) -> Result<Child> {
+fn start_ffmpeg(ffmpeg: &Path, options: &VideoOptions, audio: &Path, frames: u32) -> Result<Child> {
     let mut command = Command::new(ffmpeg);
     command
         .arg("-y")
         .args(["-loglevel", "error"])
-        .args(["-f", "rawvideo", "-pixel_format", "rgb24"])
+        .args(["-f", "rawvideo", "-pixel_format", "rgba"])
         .args(["-video_size", &format!("{}x{}", options.width, options.height)])
         .args(["-framerate", &options.fps.to_string()])
         .args(["-i", "-"])
         .arg("-i")
         .arg(audio)
-        .args(["-c:v", "libx264", "-preset", "medium", "-pix_fmt", "yuv420p"])
-        .args(["-crf", &options.crf.to_string()])
+        .args(["-c:v", &options.codec]);
+    // NVENC takes the RGBA frames as they are and converts them to 4:2:0 on the GPU; a CPU
+    // filter or encoder needs ffmpeg to convert first.
+    if !options.codec.ends_with("_nvenc") || options.video_filter.is_some() {
+        command.args(["-pix_fmt", "yuv420p"]);
+    }
+    if options.codec.ends_with("_nvenc") {
+        command.args(["-preset", "p5", "-tune", "hq", "-rc", "vbr", "-cq", &options.crf.to_string(), "-b:v", "0"]);
+    } else {
+        command.args(["-preset", "medium", "-crf", &options.crf.to_string()]);
+    }
+    if let Some(filter) = &options.video_filter {
+        command.args(["-vf", filter]);
+    }
+    command
         .args(["-c:a", "aac", "-b:a", "192k"])
-        .arg("-shortest")
+        // The exact length, rather than -shortest: -shortest makes ffmpeg hold seconds of raw
+        // frames in its sync queue (about 2 GB at 1080p), which rules out renders side by side.
+        .args(["-t", &format!("{:.6}", f64::from(frames) / f64::from(options.fps))])
         .arg(&options.path)
         .stdin(Stdio::piped())
         .stdout(Stdio::null());

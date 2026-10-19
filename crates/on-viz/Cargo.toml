@@ -16,13 +16,15 @@ on-audio = { workspace = true, default-features = false }
 anyhow.workspace = true
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 glam.workspace = true
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 tracing.workspace = true
 bevy_egui = { version = "0.42", optional = true }
 rfd = { version = "0.17", optional = true }
 
 [features]
 default = ["render"]
-render = ["dep:bevy", "dep:bevy_egui", "dep:rfd", "dep:image", "on-audio/playback"]
+render = ["dep:bevy", "dep:bevy_egui", "dep:rfd", "dep:image", "dep:serde", "dep:serde_json", "on-audio/playback"]
 
 [lints]
 workspace = true

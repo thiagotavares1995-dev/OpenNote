@@ -11,6 +11,8 @@ mod hands;
 pub mod layout;
 pub mod motion;
 #[cfg(feature = "render")]
+pub mod overlay;
+#[cfg(feature = "render")]
 pub mod render;
 pub mod rig;
 #[cfg(feature = "render")]

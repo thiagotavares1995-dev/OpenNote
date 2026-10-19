@@ -40,6 +40,20 @@ pub struct RenderArgs {
     #[arg(long, default_value_t = 18, value_parser = clap::value_parser!(u8).range(0..=51))]
     pub crf: u8,
 
+    /// The ffmpeg video encoder: libx264 on the CPU, or h264_nvenc / hevc_nvenc on an
+    /// NVIDIA GPU (where --crf is used as the constant quality level).
+    #[arg(long, default_value = "libx264")]
+    pub codec: String,
+
+    /// An ffmpeg -vf filter applied while encoding, such as burnt-in subtitles.
+    #[arg(long)]
+    pub video_filter: Option<String>,
+
+    /// An information overlay drawn by the GPU: a JSON file naming a fixed image, fonts
+    /// and timed lines of text (see on-viz's overlay module).
+    #[arg(long)]
+    pub overlay: Option<PathBuf>,
+
     /// The ffmpeg executable, if it is not on PATH.
     #[arg(long, default_value = "ffmpeg")]
     pub ffmpeg: PathBuf,
@@ -64,6 +78,9 @@ pub fn run(args: RenderArgs) -> Result<()> {
             speed: args.speed,
             ffmpeg: args.ffmpeg,
             crf: args.crf,
+            codec: args.codec,
+            video_filter: args.video_filter,
+            overlay: args.overlay,
             note_colours: settings.note_colours,
         },
     )
