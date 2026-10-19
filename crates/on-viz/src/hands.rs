@@ -795,3 +795,25 @@ mod tests {
         assert!(hand.angle_between(wrist_in_model) < 2e-3, "the hand keeps the orientation it was given");
     }
 }
+
+/// Whether the hands, when there are any, have loaded, been rigged and been given their skin;
+/// the export waits for this before its first frame.
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct HandsSettled<'w, 's> {
+    performance: Res<'w, Performance>,
+    assets: Res<'w, AssetServer>,
+    roots: Query<'w, 's, &'static bevy::world_serialization::WorldAssetRoot, With<HandRig>>,
+    pending: Query<'w, 's, (), With<NeedsRigging>>,
+    bare: Query<'w, 's, (), (With<SkinnedMesh>, Without<HandMesh>)>,
+    skinned: Query<'w, 's, (), With<HandMesh>>,
+}
+
+impl HandsSettled<'_, '_> {
+    pub(crate) fn ready(&self) -> bool {
+        !self.performance.hands_available
+            || (self.pending.is_empty()
+                && self.bare.is_empty()
+                && !self.skinned.is_empty()
+                && self.roots.iter().all(|root| self.assets.is_loaded_with_dependencies(&root.0)))
+    }
+}

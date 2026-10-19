@@ -17,7 +17,22 @@ use crate::render::{Audio, Performance, Transport, VisualizerPlugin, LEAD_IN};
 
 const TAIL_SECONDS: f64 = 2.0;
 
-const WARMUP_FRAMES: u32 = 240;
+/// The most app updates spent warming up before the first frame, whatever is still loading.
+const WARMUP_LIMIT: u32 = 2400;
+
+/// Updates in a row with the hands in place and no render pipeline still compiling before the
+/// scene counts as ready.
+const READY_STREAK: u32 = 8;
+
+/// Updates after the scene is ready, still at the first moment, so that the temporal
+/// anti-aliasing history and everything else that settles over frames has settled. The history
+/// of a still scene converges slowly; with the scene ready after the usual fifty-odd updates,
+/// this gives the first frame the same settled history as the fixed warm-up of 240 did.
+const SETTLE_UPDATES: u32 = 192;
+
+/// The first frame is captured on an update whose frame count is a multiple of this, the
+/// length of the anti-aliasing jitter sequence, as it was after the fixed warm-up of 240.
+const JITTER_PERIOD: u32 = 8;
 
 #[derive(Debug, Clone)]
 pub struct VideoOptions {
@@ -64,7 +79,11 @@ struct Export {
     /// The next frame to hand to the encoder; frames captured early wait in `ready`.
     sent: u32,
     total: u32,
+    /// Updates spent warming up so far, and those in a row with the scene ready.
     warmup: u32,
+    ready_streak: u32,
+    /// The update from which the first frame may be captured, once the scene is ready.
+    capture_from: Option<u32>,
     in_flight: u32,
     ready: BTreeMap<u32, Vec<u8>>,
     frames: SyncSender<Vec<u8>>,
@@ -87,51 +106,70 @@ pub fn export(performance: Performance, options: VideoOptions) -> Result<()> {
     let ffmpeg = check_ffmpeg(&options.ffmpeg)?;
 
     let audio_path = options.path.with_extension("opennote.wav");
-    let notes = performance.timeline.audio_notes();
-    let last = performance.timeline.duration;
-    on_audio::render_to_wav(
-        &audio_path,
-        notes,
-        48_000,
-        LEAD_IN,
-        options.speed,
-        TAIL_SECONDS,
-        performance.soundfont.as_deref(),
-    )
-    .context("rendering the soundtrack")?;
     let _soundtrack = Scratch(audio_path.clone());
-    #[cfg(feature = "perfil")]
-    crate::perfil::marca("wav_pronto");
-
+    let last = performance.timeline.duration;
     let seconds = (last - LEAD_IN + TAIL_SECONDS) / options.speed.max(1e-6);
     let total = (seconds * f64::from(options.fps)).ceil() as u32;
     #[cfg(feature = "perfil")]
     let total = crate::perfil::parar_em().map_or(total, |limite| total.min(limite));
 
-    let mut encoder = start_ffmpeg(&ffmpeg, &options, &audio_path, total)?;
-    let stdin = encoder.stdin.take().context("ffmpeg did not give us anywhere to write frames")?;
+    // The soundtrack is rendered while the app starts up and warms up; ffmpeg, which reads it,
+    // is started once it is written, and until then the frames wait for ffmpeg as they would
+    // for a slow encoder.
+    let soundtrack = {
+        let path = audio_path.clone();
+        let notes = performance.timeline.audio_notes();
+        let soundfont = performance.soundfont.clone();
+        let speed = options.speed;
+        std::thread::Builder::new()
+            .name("opennote-soundtrack".into())
+            .spawn(move || {
+                let written =
+                    on_audio::render_to_wav(&path, notes, 48_000, LEAD_IN, speed, TAIL_SECONDS, soundfont.as_deref())
+                        .context("rendering the soundtrack");
+                #[cfg(feature = "perfil")]
+                crate::perfil::marca("wav_pronto");
+                written
+            })
+            .context("starting the soundtrack thread")?
+    };
 
     // Bounded, so that rendering waits for the encoder rather than holding every frame
     // it has not yet taken in memory.
     let (frames, incoming) = mpsc::sync_channel::<Vec<u8>>(FRAMES_IN_FLIGHT);
     let trouble = Arc::new(AtomicBool::new(false));
     let report = Arc::clone(&trouble);
+    let encoding = (ffmpeg, options.clone(), audio_path.clone());
     let writer = std::thread::Builder::new()
         .name("opennote-encode".into())
-        .spawn(move || {
+        .spawn(move || -> Result<Child> {
+            let started = match soundtrack.join() {
+                Ok(written) => written.and_then(|_| start_ffmpeg(&encoding.0, &encoding.1, &encoding.2, total)),
+                Err(_) => Err(anyhow::anyhow!("the soundtrack thread panicked")),
+            };
+            let mut encoder = match started {
+                Ok(encoder) => encoder,
+                Err(error) => {
+                    report.store(true, Ordering::Relaxed);
+                    return Err(error);
+                }
+            };
+            let Some(stdin) = encoder.stdin.take() else {
+                report.store(true, Ordering::Relaxed);
+                bail!("ffmpeg did not give us anywhere to write frames");
+            };
             let mut stdin = std::io::BufWriter::with_capacity(1 << 20, stdin);
             #[cfg(feature = "perfil")]
             let mut hashes = crate::perfil::arquivo_hashes().map(|caminho| (caminho, String::new()));
             for frame in incoming {
                 #[cfg(feature = "perfil")]
                 if let Some((_, texto)) = hashes.as_mut() {
-                    texto.push_str(&format!("{:016x}
-", crate::perfil::hash_quadro(&frame)));
+                    texto.push_str(&format!("{:016x}\n", crate::perfil::hash_quadro(&frame)));
                 }
                 if let Err(error) = stdin.write_all(&frame) {
                     tracing::error!("ffmpeg stopped taking frames: {error}");
                     report.store(true, Ordering::Relaxed);
-                    return;
+                    return Ok(encoder);
                 }
             }
             if let Err(error) = stdin.flush() {
@@ -142,6 +180,7 @@ pub fn export(performance: Performance, options: VideoOptions) -> Result<()> {
             if let Some((caminho, texto)) = hashes {
                 let _ = std::fs::write(caminho, texto);
             }
+            Ok(encoder)
         })
         .context("starting the encoder thread")?;
 
@@ -178,6 +217,7 @@ pub fn export(performance: Performance, options: VideoOptions) -> Result<()> {
         start: LEAD_IN,
     });
     app.add_systems(First, drive_export);
+    install_pipeline_watch(&mut app);
     if let Some(overlay) = overlay {
         overlay.install(&mut app);
     }
@@ -191,7 +231,10 @@ pub fn export(performance: Performance, options: VideoOptions) -> Result<()> {
     #[cfg(feature = "perfil")]
     crate::perfil::marca("app_fim");
     drop(app);
-    let _ = writer.join();
+    let mut encoder = match writer.join() {
+        Ok(encoder) => encoder?,
+        Err(_) => bail!("the encoder thread panicked"),
+    };
     let status = encoder.wait().context("waiting for ffmpeg")?;
     #[cfg(feature = "perfil")]
     {
@@ -264,7 +307,9 @@ fn build_export_resource(mut commands: Commands) {
             frame: 0,
             sent: 0,
             total: pending.total,
-            warmup: WARMUP_FRAMES,
+            warmup: 0,
+            ready_streak: 0,
+            capture_from: None,
             in_flight: 0,
             ready: BTreeMap::new(),
             frames: pending.frames,
@@ -303,11 +348,65 @@ fn aim_camera_at_target(
     }
 }
 
+/// Whether the render world, after its last update, had no pipeline waiting to be compiled.
+#[derive(Resource, Clone, Default)]
+struct PipelinesSettled(Arc<AtomicBool>);
+
+fn install_pipeline_watch(app: &mut App) {
+    use bevy::render::render_resource::PipelineCache;
+    use bevy::render::{Render, RenderApp, RenderSystems};
+
+    let settled = PipelinesSettled::default();
+    app.insert_resource(settled.clone());
+    if let Some(render) = app.get_sub_app_mut(RenderApp) {
+        render.insert_resource(settled).add_systems(
+            Render,
+            (|cache: Res<PipelineCache>, settled: Res<PipelinesSettled>| {
+                settled.0.store(cache.waiting_pipelines().next().is_none(), Ordering::Relaxed);
+            })
+            .in_set(RenderSystems::Cleanup),
+        );
+    }
+}
+
+/// Holds the first moment until the scene is drawn in full: the hands loaded and skinned and no
+/// pipeline still compiling, then a fixed number of updates more, ending in step with the
+/// anti-aliasing jitter. Returns whether to keep warming up.
+fn warming_up(export: &mut Export, hands: bool, pipelines: bool, frame_count: u32) -> bool {
+    if let Some(from) = export.capture_from {
+        if export.warmup < from {
+            export.warmup += 1;
+            return true;
+        }
+        return false;
+    }
+    export.warmup += 1;
+    export.ready_streak = if hands && pipelines { export.ready_streak + 1 } else { 0 };
+    let ready = export.ready_streak >= READY_STREAK;
+    if ready || export.warmup >= WARMUP_LIMIT {
+        if !ready {
+            warn!("the scene was still loading after {WARMUP_LIMIT} updates; exporting anyway");
+        }
+        // `warmup` counts the updates so far, `frame_count` the ones before this, so the first
+        // frame lands on an update whose frame count is a multiple of the jitter period.
+        let after = export.warmup + SETTLE_UPDATES;
+        let count_then = frame_count + SETTLE_UPDATES + 1;
+        let align = (JITTER_PERIOD - count_then % JITTER_PERIOD) % JITTER_PERIOD;
+        export.capture_from = Some(after + align);
+        #[cfg(feature = "perfil")]
+        crate::perfil::contar("aquecimento_ate_pronto", u64::from(export.warmup));
+    }
+    true
+}
+
 fn drive_export(
     mut commands: Commands,
     export: Option<ResMut<Export>>,
     mut transport: ResMut<Transport>,
     clock: Option<ResMut<crate::overlay::OverlayClock>>,
+    hands: crate::hands::HandsSettled,
+    pipelines: Res<PipelinesSettled>,
+    frame_count: Res<bevy::diagnostic::FrameCount>,
     mut exit: MessageWriter<AppExit>,
 ) {
     medir!("drive_export");
@@ -323,8 +422,9 @@ fn drive_export(
         crate::perfil::marca("aquecimento_inicio");
         crate::perfil::contar("updates", 1);
     }
-    if export.warmup > 0 {
-        export.warmup -= 1;
+    if export.frame == 0
+        && warming_up(&mut export, hands.ready(), pipelines.0.load(Ordering::Relaxed), frame_count.0)
+    {
         transport.position = export.start;
         transport.playing = false;
         return;
