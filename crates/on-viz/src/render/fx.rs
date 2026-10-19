@@ -234,6 +234,7 @@ pub(crate) fn update_sparks(
     visuals: Res<Visuals>,
     playing: Res<Playing>,
     sparks: Query<(&mut Transform, &mut Visibility, &mut MeshMaterial3d<StandardMaterial>), With<Spark>>,
+    mut throwing: Local<Option<crate::timeline::janela::TimeIndex>>,
 ) {
     medir!("update_sparks");
     if !visuals.effects {
@@ -249,11 +250,40 @@ pub(crate) fn update_sparks(
     let mut slots = sparks.into_iter();
     let stagger = SPARK_LIFE / SPARKS_PER_NOTE as f32;
 
-    for (index, note) in performance.timeline.notes.iter().enumerate() {
+    // Only the notes throwing sparks now are visited, in their order in the piece: the slots
+    // and the seeds (which use the note's index) come out as from a pass over every note.
+    let notes = &performance.timeline.notes;
+    let done = |note: &crate::TimelineNote| {
+        (note.end + f64::from(SPARK_TAIL_SECONDS)).min(note.restruck.unwrap_or(f64::INFINITY))
+    };
+    if performance.is_changed() || throwing.is_none() {
+        let spans = notes.iter().map(|note| (note.start, done(note)));
+        *throwing = Some(crate::timeline::janela::TimeIndex::new(spans));
+    }
+    let window = throwing.as_ref().map_or(&[][..], |index| index.at(now));
+    let candidates: Box<dyn Iterator<Item = usize>> = Box::new(window.iter().map(|&i| i as usize));
+    #[cfg(feature = "perfil")]
+    let candidates: Box<dyn Iterator<Item = usize>> =
+        if crate::perfil::sem_janela() { Box::new(0..notes.len()) } else { candidates };
+    #[cfg(feature = "perfil")]
+    if crate::perfil::conferir_janela() && !crate::perfil::sem_janela() {
+        let throws = |index: &usize| {
+            let note = &notes[*index];
+            playing.0[note.hand as usize] && now >= note.start && now < done(note)
+        };
+        let windowed: Vec<usize> = window.iter().map(|&i| i as usize).filter(throws).collect();
+        let every: Vec<usize> = (0..notes.len()).filter(throws).collect();
+        if windowed != every {
+            crate::perfil::divergencia("update_sparks", || format!("t={now}: {windowed:?} != {every:?}"));
+        }
+    }
+
+    for index in candidates {
+        let note = &notes[index];
         if !playing.0[note.hand as usize] {
             continue;
         }
-        let done = (note.end + f64::from(SPARK_TAIL_SECONDS)).min(note.restruck.unwrap_or(f64::INFINITY));
+        let done = done(note);
         if now < note.start || now >= done {
             continue;
         }

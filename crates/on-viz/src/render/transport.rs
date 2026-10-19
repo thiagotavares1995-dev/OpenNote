@@ -304,9 +304,28 @@ pub(crate) fn settle_keys(
     performance: Res<Performance>,
     playing: Res<Playing>,
     mut keys: ResMut<Keys>,
+    mut moving: Local<Option<crate::timeline::janela::TimeIndex>>,
 ) {
     medir!("settle_keys");
-    keys.0 = performance.timeline.key_depression_for(transport.position, playing.0);
+    let timeline = &performance.timeline;
+    let now = transport.position;
+    #[cfg(feature = "perfil")]
+    if crate::perfil::sem_janela() {
+        keys.0 = timeline.key_depression_for(now, playing.0);
+        return;
+    }
+    if performance.is_changed() || moving.is_none() {
+        *moving = Some(crate::timeline::janela::TimeIndex::new(timeline.key_spans()));
+    }
+    let candidates = moving.as_ref().map_or(&[][..], |index| index.at(now));
+    keys.0 = timeline.key_depression_among(now, playing.0, candidates.iter().map(|&i| i as usize));
+    #[cfg(feature = "perfil")]
+    if crate::perfil::conferir_janela() {
+        let all = timeline.key_depression_for(now, playing.0);
+        if all != keys.0 {
+            crate::perfil::divergencia("settle_keys", || format!("t={now}"));
+        }
+    }
 }
 
 /// Hears only the hands that are playing, again whenever that changes.

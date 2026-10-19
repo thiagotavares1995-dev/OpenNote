@@ -71,6 +71,32 @@ pub fn medir(nome: &'static str) -> Medida {
     Medida(nome, Instant::now())
 }
 
+fn ligada(nome: &str) -> bool {
+    std::env::var(nome).is_ok_and(|v| v == "1")
+}
+
+/// `OPENNOTE_SEM_JANELA=1`: the systems visit every note, as before the time index, to compare.
+pub fn sem_janela() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| ligada("OPENNOTE_SEM_JANELA"))
+}
+
+/// `OPENNOTE_CONFERIR_JANELA=1`: every frame, also work out the result over every note and count
+/// any difference from the indexed one (`divergencias_janela`).
+pub fn conferir_janela() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| ligada("OPENNOTE_CONFERIR_JANELA"))
+}
+
+/// Records a difference found by `conferir_janela`, printing the first few.
+pub fn divergencia(onde: &str, detalhe: impl FnOnce() -> String) {
+    contar("divergencias_janela", 1);
+    let n = dados().contadores.get("divergencias_janela").copied().unwrap_or(0);
+    if n <= 10 {
+        eprintln!("janela diverge em {onde}: {}", detalhe());
+    }
+}
+
 pub fn parar_em() -> Option<u32> {
     std::env::var("OPENNOTE_PARAR_EM").ok()?.parse().ok()
 }
@@ -171,15 +197,25 @@ pub(crate) mod agenda {
             })
             .before(S::ExtractCommands),
         );
-        let fases: [(&'static str, S, Option<S>); 10] = [
+        let fases: [(&'static str, S, Option<S>); 16] = [
             ("render:ExtractCommands", S::ExtractCommands, Some(S::PrepareMeshes)),
             ("render:PrepareAssets+Meshes", S::PrepareMeshes, Some(S::CreateViews)),
             ("render:CreateViews", S::CreateViews, Some(S::Specialize)),
             ("render:Specialize", S::Specialize, Some(S::PrepareViews)),
             ("render:PrepareViews", S::PrepareViews, Some(S::Queue)),
             ("render:Queue", S::Queue, Some(S::PhaseSort)),
-            ("render:PhaseSort", S::PhaseSort, Some(S::Prepare)),
-            ("render:Prepare", S::Prepare, Some(S::Render)),
+            ("render:PhaseSort", S::PhaseSort, Some(S::PrepareResources)),
+            ("render:Prepare.Resources", S::PrepareResources, Some(S::PrepareResourcesBatchPhases)),
+            ("render:Prepare.BatchPhases", S::PrepareResourcesBatchPhases, Some(S::PrepareResourcesWritePhaseBuffers)),
+            (
+                "render:Prepare.WritePhaseBuffers",
+                S::PrepareResourcesWritePhaseBuffers,
+                Some(S::PrepareResourcesCollectPhaseBuffers),
+            ),
+            ("render:Prepare.CollectPhaseBuffers", S::PrepareResourcesCollectPhaseBuffers, Some(S::PrepareResourcesFlush)),
+            ("render:Prepare.Flush", S::PrepareResourcesFlush, Some(S::PrepareBindGroups)),
+            ("render:Prepare.BindGroups", S::PrepareBindGroups, Some(S::Render)),
+            ("render:Prepare.resto", S::Prepare, Some(S::Render)),
             ("render:Render(grafo)", S::Render, Some(S::Cleanup)),
             ("render:Cleanup", S::PostCleanup, None),
         ];

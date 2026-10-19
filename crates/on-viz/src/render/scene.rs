@@ -268,32 +268,120 @@ pub(crate) fn bar_extent(layout: &Layout, bar: &NoteBar, now: f64) -> (f32, f32)
     (bottom, height)
 }
 
+/// A bar starts moving this long before it can enter the lane and keeps moving this long after
+/// it has left. The renderer takes a mesh's previous position, for the motion vectors of the
+/// temporal anti-aliasing, from the last time it moved; so a bar must already be moving the
+/// frame before it shows, as it was when every bar moved every frame.
+const BAR_LEAD_SECONDS: f64 = 0.5;
+
+/// The bars that may be in the lane at a moment, so that the systems drawing them visit those
+/// and not every note of the piece. The bars are listed in the order the query gave them when
+/// the window was built, again whenever bars were added or changed shape.
+#[derive(Default)]
+pub(crate) struct BarWindow {
+    bars: Vec<Entity>,
+    index: crate::timeline::janela::TimeIndex,
+}
+
+/// Bars spawned, or given a component by the engine (which moves them in its storage and can
+/// change the order a query lists them in), since a system last looked.
+pub(crate) type ReshapedBars<'w, 's> = Query<
+    'w,
+    's,
+    (),
+    (
+        With<NoteBar>,
+        Or<(Added<NoteBar>, Added<bevy::camera::primitives::Aabb>, Added<bevy::pbr::PreviousGlobalTransform>)>,
+    ),
+>;
+
+impl BarWindow {
+    fn build<'a>(layout: &Layout, bars: impl Iterator<Item = (Entity, &'a NoteBar)>) -> Self {
+        let lane = f64::from(layout.lane_height).max(1e-3);
+        // A bar is in the lane from `lookahead` before its start until its drawn height (at
+        // least 6 mm) has passed below the line.
+        let (bars, spans): (Vec<Entity>, Vec<(f64, f64)>) = bars
+            .map(|(entity, bar)| {
+                let shown_for = bar.duration.max(6.0 * layout.lookahead / lane);
+                let span = (bar.start - layout.lookahead - BAR_LEAD_SECONDS, bar.start + shown_for + BAR_LEAD_SECONDS);
+                (entity, span)
+            })
+            .unzip();
+        Self { bars, index: crate::timeline::janela::TimeIndex::new(spans) }
+    }
+
+    fn at(&self, now: f64) -> impl Iterator<Item = Entity> + '_ {
+        self.index.at(now).iter().map(|&i| self.bars[i as usize])
+    }
+}
+
 pub(crate) fn move_notes(
     transport: Res<Transport>,
     performance: Res<Performance>,
-    bars: Query<(&NoteBar, &mut Transform, &mut Visibility)>,
+    reshaped: ReshapedBars,
+    mut window: Local<BarWindow>,
+    mut shown: Local<Vec<Entity>>,
+    mut bars: Query<(Entity, &NoteBar, &mut Transform, &mut Visibility)>,
 ) {
     medir!("move_notes");
     let layout = &performance.layout;
     let now = transport.position;
-    #[cfg(feature = "perfil")]
-    let mut visiveis = 0u64;
-    for (bar, mut transform, mut visibility) in bars {
+    let place = |bar: &NoteBar| {
         let (bottom, height) = bar_extent(layout, bar, now);
         let top = bottom + height;
+        let y = bottom + height / 2.0 + (LANE_Z + 1.0 - NOTE_Z) * CAMERA_TILT_DEG.to_radians().tan();
+        (y, top > 0.0 && bottom < layout.lane_height)
+    };
+    #[cfg(feature = "perfil")]
+    if crate::perfil::sem_janela() {
+        let mut visiveis = 0u64;
+        for (_, bar, mut transform, mut visibility) in &mut bars {
+            let (y, visible) = place(bar);
+            transform.translation.y = y;
+            *visibility = if visible { Visibility::Visible } else { Visibility::Hidden };
+            visiveis += u64::from(visible);
+        }
+        crate::perfil::pico("barras_visiveis", visiveis);
+        return;
+    }
 
-        transform.translation.y =
-            bottom + height / 2.0 + (LANE_Z + 1.0 - NOTE_Z) * CAMERA_TILT_DEG.to_radians().tan();
-
-        *visibility =
-            if top > 0.0 && bottom < layout.lane_height { Visibility::Visible } else { Visibility::Hidden };
-        #[cfg(feature = "perfil")]
-        if *visibility == Visibility::Visible {
-            visiveis += 1;
+    if performance.is_changed() || !reshaped.is_empty() {
+        *window = BarWindow::build(layout, bars.iter().map(|(entity, bar, _, _)| (entity, bar)));
+    }
+    let mut still = Vec::with_capacity(shown.len() + 16);
+    for entity in window.at(now) {
+        let Ok((_, bar, mut transform, mut visibility)) = bars.get_mut(entity) else { continue };
+        let (y, visible) = place(bar);
+        transform.translation.y = y;
+        visibility.set_if_neq(if visible { Visibility::Visible } else { Visibility::Hidden });
+        if visible {
+            still.push(entity);
         }
     }
+    // Bars that were showing and are no longer in the window (after a jump in time).
+    for entity in shown.drain(..) {
+        if !still.contains(&entity) {
+            if let Ok((_, _, _, mut visibility)) = bars.get_mut(entity) {
+                visibility.set_if_neq(Visibility::Hidden);
+            }
+        }
+    }
+    *shown = still;
     #[cfg(feature = "perfil")]
-    crate::perfil::pico("barras_visiveis", visiveis);
+    {
+        crate::perfil::pico("barras_visiveis", shown.len() as u64);
+        if crate::perfil::conferir_janela() {
+            for (entity, bar, transform, visibility) in &bars {
+                let (y, visible) = place(bar);
+                let wanted = if visible { Visibility::Visible } else { Visibility::Hidden };
+                if *visibility != wanted || (visible && transform.translation.y != y) {
+                    crate::perfil::divergencia("move_notes", || {
+                        format!("t={now} {entity}: {visibility:?} y={} != {wanted:?} y={y}", transform.translation.y)
+                    });
+                }
+            }
+        }
+    }
 }
 
 pub(crate) fn press_keys(
@@ -340,7 +428,9 @@ pub(crate) fn update_labels(
     transport: Res<Transport>,
     performance: Res<Performance>,
     camera: Query<(&Camera, &GlobalTransform)>,
-    bars: Query<(&NoteBar, &Transform)>,
+    bars: Query<(Entity, &NoteBar, &Transform)>,
+    reshaped: ReshapedBars,
+    mut window: Local<BarWindow>,
     labels: Query<(&mut Node, &mut Text, &mut TextColor), With<FingerLabel>>,
 ) {
     medir!("update_labels");
@@ -351,15 +441,14 @@ pub(crate) fn update_labels(
     let layout = &performance.layout;
     let now = transport.position;
 
-    let mut wanted: Vec<(f32, u8, Hand, Vec3)> = Vec::new();
-    for (bar, transform) in &bars {
-        let Some(finger) = bar.finger else { continue };
+    let wanted_of = |bar: &NoteBar, transform: &Transform, wanted: &mut Vec<(f32, u8, Hand, Vec3)>| {
+        let Some(finger) = bar.finger else { return };
         let (bottom, height) = bar_extent(layout, bar, now);
         let top = bottom + height;
         let visible_bottom = bottom.max(0.0);
         let visible_height = top - visible_bottom;
         if visible_height < MIN_LABELLED_HEIGHT_MM || bottom > layout.lane_height {
-            continue;
+            return;
         }
         let anchor = Vec3::new(
             transform.translation.x,
@@ -367,8 +456,41 @@ pub(crate) fn update_labels(
             LANE_Z + 1.0,
         );
         wanted.push((visible_bottom, finger, bar.hand, anchor));
+    };
+    let every_bar = |wanted: &mut Vec<(f32, u8, Hand, Vec3)>| {
+        for (_, bar, transform) in &bars {
+            wanted_of(bar, transform, wanted);
+        }
+    };
+    let mut wanted: Vec<(f32, u8, Hand, Vec3)> = Vec::new();
+    #[cfg(feature = "perfil")]
+    let todas = crate::perfil::sem_janela();
+    #[cfg(not(feature = "perfil"))]
+    let todas = false;
+    if todas {
+        every_bar(&mut wanted);
+    } else {
+        // Only the bars that may be in the lane, in the order the query lists them, so that
+        // labels at the same height sort as they did over every bar.
+        if performance.is_changed() || !reshaped.is_empty() {
+            *window = BarWindow::build(layout, bars.iter().map(|(entity, bar, _)| (entity, bar)));
+        }
+        for entity in window.at(now) {
+            if let Ok((_, bar, transform)) = bars.get(entity) {
+                wanted_of(bar, transform, &mut wanted);
+            }
+        }
     }
     wanted.sort_by(|a, b| a.0.total_cmp(&b.0));
+    #[cfg(feature = "perfil")]
+    if crate::perfil::conferir_janela() && !todas {
+        let mut all = Vec::new();
+        every_bar(&mut all);
+        all.sort_by(|a, b| a.0.total_cmp(&b.0));
+        if all != wanted {
+            crate::perfil::divergencia("update_labels", || format!("t={now}: {} != {} rótulos", wanted.len(), all.len()));
+        }
+    }
     wanted.truncate(MAX_LABELS);
 
     let mut slot = 0;

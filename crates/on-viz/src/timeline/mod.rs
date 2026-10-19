@@ -1,6 +1,8 @@
 //! The performance in time: which keys are down, the grips each hand makes, and the hand
 //! poses between them, including how the two hands keep out of each other's way.
 
+pub mod janela;
+
 use std::collections::BTreeMap;
 
 use on_fingering::biomech::{BiomechModel, Grip};
@@ -356,8 +358,21 @@ impl Timeline {
 
     /// The keys down at a moment, counting only the hands that are playing.
     pub fn key_depression_for(&self, time: f64, playing: [bool; 2]) -> KeyStates {
+        self.key_depression_among(time, playing, 0..self.notes.len())
+    }
+
+    /// As `key_depression_for`, looking only at `candidates`: indices into `notes`, in
+    /// increasing order, that include every note whose key moves at `time` (an index built
+    /// from `key_spans` lists them).
+    pub fn key_depression_among(
+        &self,
+        time: f64,
+        playing: [bool; 2],
+        candidates: impl IntoIterator<Item = usize>,
+    ) -> KeyStates {
         let mut states = KeyStates::default();
-        for note in self.notes.iter().filter(|note| playing[note.hand as usize]) {
+        let notes = candidates.into_iter().map(|index| &self.notes[index]);
+        for note in notes.filter(|note| playing[note.hand as usize]) {
             if time < note.key_moves || time > note.key_rises + KEY_RELEASE_SECONDS {
                 continue;
             }
@@ -373,12 +388,17 @@ impl Timeline {
         states
     }
 
+    /// For each note, the stretch of time in which its key is moving or down.
+    pub fn key_spans(&self) -> impl Iterator<Item = (f64, f64)> + '_ {
+        self.notes.iter().map(|note| (note.key_moves, note.key_rises + KEY_RELEASE_SECONDS))
+    }
+
     pub fn visible_notes(&self, time: f64, lookahead: f64) -> impl Iterator<Item = &TimelineNote> {
         self.notes.iter().filter(move |n| n.end > time - 0.5 && n.start < time + lookahead)
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct KeyStates {
     pub depth: Vec<f32>,
     pub hand: Vec<Option<Hand>>,
